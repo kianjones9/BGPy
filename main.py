@@ -1,6 +1,11 @@
 import socket
 from binascii import hexlify
 from math import log,ceil,floor
+import time, threading
+from events.Event import ManualStartEvent
+import asyncio
+from queue import Queue
+
 
 BGP_MESSAGE_TYPES = {
     "NONE": 0 ,
@@ -21,6 +26,125 @@ BGP_ATTRIBUTE_TYPE_CODES = {
     "AGGREGATOR": 7
 }
 
+BGP_STATES = {
+    "IDLE": 1,
+    "CONNECT": 2,
+    "ACTIVE": 3
+}
+
+class BGPStateMachine:
+    def __init__(self):
+        self.state = BGP_STATES["IDLE"]
+
+    def set_state(self,state):
+        self.state = state
+
+class BGPPeer:
+    def __init__(self,bgp,address,asn,port=179):
+        self.state = BGPStateMachine()
+        self.address = address
+        self.asn = asn
+        self.bgp = bgp
+        self.port = port
+        self.connect_retry_timer_interval = 10 # DETERMINE HOW THIS SHOULD BE SET
+        self.in_queue = Queue()
+        self.out_queue = Queue()
+
+    def send_open_message(self):
+        message = OpenMessage(self.bgp.asn,self.bgp.identifier,self.active_connection)
+        message.send()
+
+    def init_client_connection(self):
+        self.active_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.active_connection.connect((self.address,self.port))
+
+    def get_messages(self):
+        header = self.active_connection.recv(19)
+        length = header[16*8: 16*8 + 16] if header else -1
+        msg = ''
+        if length != -1:
+            msg = self.active_connection.recv(int(length,16) - 19)
+        print(header)
+        print(msg)
+        # while true
+            # rcv packet header
+            # get length from header
+            # rcv (length-header)
+
+        # grab packet length
+        
+        
+        
+
+
+
+    # def connect(self,passive=False):
+    #     if not passive:
+    #         self.state.set_state(BGP_STATES["CONNECT"])
+    #     else:
+    #         self.state.set_state(BGP_STATES["ACTIVE"])
+
+    #     if not passive:
+    #         self.active_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    #         self.active_connection.connect(self.address,self.port)
+
+    #     self.passive_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    #     server_address = ('localhost', 179)
+    #     self.passive_connection.bind(server_address)
+    #     self.passive_connection.listen(1)
+
+    #     self.connect_retry_counter = 0
+    #     self.connect_retry_timer = threading.Timer(self.connect_retry_timer_interval, self.connect_retry_timer_expired)
+    #     self.connect_retry_timer.start()
+
+    # def disconnect(self):
+    #     self.active_connection.close()
+    #     self.connect_retry_counter = 0
+    #     self.connect_retry_timer.cancel()
+    #     self.state.set_state(BGP_STATES["IDLE"])
+
+
+class BGP:
+    def __init__(self,asn,identifier):
+        self.events = Queue()
+        self.peers = []
+        self.asn = asn
+        self.identifier = identifier
+
+        # try:
+        #     thread.start_new_thread(self.process_messages, (self.peers))
+        #     thread.start_new_thread(self.process_events, (self.events_queue))
+        #     while threading.activeCount():
+        #         pass
+        # except:
+        #     print ("Error: unable to start thread")
+    
+    def add_peer(self, address, asn, port=179):
+        peer = BGPPeer(self, address, asn, port)
+        self.peers.append(peer)
+        return peer
+    
+    def remove_peer(self, peer):
+        self.peers.remove(peer)
+        return peer
+        
+# dispatch correct event (ex. Event 19: BGPOpen, Event 25: NotifMsg, Event 26: KeepAliveMsg, Event 27: UpdateMsg)
+    def process_events(self, events):
+        
+        while True:
+            if events:
+                events.get().execute()
+
+    def process_messages(self, peers):
+    
+        while True:
+            for peer in peers:
+                while not peer.in_queue.empty():
+                    peer.in_queue.get().process()
+                while not peer.out_queue.empty():
+                    peer.out_queue.get().process()
+
+                
 class Utils:
     @staticmethod
     def identify_protocol(address):
@@ -33,6 +157,12 @@ class Utils:
             return 6
         except socket.error: pass
         raise ValueError(address)
+
+    @staticmethod
+    def bytes_needed(n):
+        if n == 0:
+            return 1
+        return int(log(n, 256)) + 1
 
     @staticmethod
     def ip2hex(ip):
@@ -251,6 +381,7 @@ class Message:
 
     def send(self):
         header = MessageHeader(self.get_length(),self.type)
+        print(header.get_bytes() + self.get_bytes())
         self.connection.sendall(header.get_bytes() + self.get_bytes())
     
 
@@ -287,22 +418,23 @@ class OpenMessage(Message):
         self.opt_params = []# List of optional parameters in TLV format
 
 class UpdateMessage(Message):
-    def __init__(self, withdrawn_routes=[], path_attributes=[], nlri=[]):
+    def __init__(self, connection, withdrawn_routes=[], path_attributes=[], nlri=[]):
+        super().__init__(BGP_ATTRIBUTE_TYPE_CODES["UPDATE"],connection)
         self.withdrawn_routes = withdrawn_routes
         self.path_attributes = path_attributes
         self.nlri = nlri
         
     def get_bytes(self):
         withdrawn_routes = []
-        withdrawn_routes_length = 0
+        self.withdrawn_routes_length = 0
         for route in self.withdrawn_routes:
-            withdrawn_routes_length += (1 + ceil(route.prefix_length/8))
+            self.withdrawn_routes_length += (1 + ceil(route.prefix_length/8))
             withdrawn_routes.append(route.get_bytes())
 
         path_attributes = []
-        path_attribute_length = 0
+        self.path_attribute_length = 0
         for attr in self.path_attributes:
-            path_attribute_length += attr.get_length()
+            self.path_attribute_length += attr.get_length()
             path_attributes.append(attr.get_bytes())
 
         nlri = []
@@ -310,25 +442,64 @@ class UpdateMessage(Message):
             nlri.append(route.get_bytes())
         
         data = [
-            withdrawn_routes_length.to_bytes(2,'big'),
+            self.withdrawn_routes_length.to_bytes(2,'big'),
             b''.join(withdrawn_routes),
-            path_attribute_length.to_bytes(2,'big'),
+            self.path_attribute_length.to_bytes(2,'big'),
             b''.join(path_attributes),
             b''.join(nlri)
         ]
 
         return b''.join(data)
+
+    def get_length(self):
+        return 4 + self.withdrawn_routes_length + self.path_attribute_length
+        
+        
+class KeepAliveMessage(Message):
+    def __init__(self,connection):
+        super().__init__(BGP_MESSAGE_TYPES["KEEP_ALIVE"],connection)
+
+    def get_bytes(self):
+        return b''
+
+    def get_length(self):
+        return 0
+
+class NotificationMessage(Message):
+    def __init__(self,connection,error_code,data=None,error_subcode=0):
+        super().__init__(BGP_MESSAGE_TYPES["NOTIFICATION"],connection)
+        self.error_code = error_code # check if valid
+        self.error_subcode = error_subcode
+        if data:
+            self.data = data.to_bytes(Utils.bytes_needed(data),'big')
+        else:
+            self.data = b''
+
+    def get_bytes(self):
+        data = [
+            self.error_code.to_bytes(1,'big'),
+            self.error_subcode.to_bytes(1,'big'),
+            self.data
+        ]
+
+        return b''.join(data)
+
+    def get_length(self):
+        return 2 + len(self.data)
         
 
-        
 
+# sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# server_address = ('localhost', 180)
+# sock.connect(server_address)
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_address = ('localhost', 180)
-sock.connect(server_address)
+# message = OpenMessage(65000,'10.10.10.10',sock)
+# message.send()
 
-message = OpenMessage(65000,'10.10.10.10',sock)
-message.send()
+# message2 = UpdateMessage(sock)
+# print(message2.get_bytes())
 
-message2 = UpdateMessage()
-print(message2.get_bytes())
+bgp = BGP(65000,'0.0.0.0')
+
+event = ManualStartEvent(bgp,'localhost',65001,180)
+event.execute()
